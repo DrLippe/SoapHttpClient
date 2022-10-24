@@ -5,6 +5,8 @@ using System.Text;
 using System.Xml.Linq;
 using SoapHttpClient.Enums;
 using SoapHttpClient.DTO;
+using System.Xml.Serialization;
+using System.Xml;
 
 namespace SoapHttpClient;
 
@@ -82,6 +84,46 @@ public class SoapClient : ISoapClient
         // Execute call
         var httpClient = _httpClientFactory.CreateClient(nameof(SoapClient));
         return httpClient.PostAsync(endpoint, content, cancellationToken);
+    }
+
+
+    public T Read<T>(HttpResponseMessage message, SoapVersion soapVersion)
+    {
+        var config = new SoapMessageConfiguration(soapVersion);
+
+        if (message == null)
+            throw new ArgumentNullException();
+        if (!message.IsSuccessStatusCode)
+            throw new ArgumentException($"The provided message is not a success message: {message.StatusCode} {message.ReasonPhrase}");
+
+        var settings = new XmlReaderSettings() { DtdProcessing = DtdProcessing.Prohibit };
+
+        using (var reader = XmlReader.Create(message.Content.ReadAsStream(), settings))
+        {
+            reader.MoveToContent();
+
+            // envelope
+            if (string.IsNullOrEmpty(reader.NamespaceURI))
+                reader.ReadStartElement("Envelope");
+            else
+                reader.ReadStartElement("Envelope", config.Schema.NamespaceName);
+            reader.MoveToContent();
+
+            // body
+            reader.ReadStartElement("Body", reader.NamespaceURI);
+            reader.MoveToContent();
+
+            // response
+            if (reader.IsStartElement("Fault", reader.NamespaceURI))
+                throw new Exception();
+
+            var xmlSerializer = new XmlSerializer(typeof(T));
+            xmlSerializer.UnknownElement += (s, e) => Console.WriteLine($"found element {e.Element.Name} and expected {e.ExpectedElements}");
+
+            T result = (T)xmlSerializer.Deserialize(reader);
+
+            return result;
+        }
     }
 
     #region Private Methods
