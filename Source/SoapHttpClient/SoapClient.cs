@@ -7,6 +7,11 @@ using SoapHttpClient.Enums;
 using SoapHttpClient.DTO;
 using System.Xml.Serialization;
 using System.Xml;
+using System.Runtime.CompilerServices;
+using System.Reflection;
+using System.Data;
+using System.Xml.XPath;
+using System.Runtime.Serialization;
 
 namespace SoapHttpClient;
 
@@ -25,6 +30,12 @@ public interface ISoapClient
 
 public class SoapClient : ISoapClient
 {
+    public Uri Uri { get; set; }
+
+    public SoapVersion SoapVersion { get; set; }
+
+    public string ServiceNamespace { get; set; }
+
     private readonly IHttpClientFactory _httpClientFactory;
 
     /// <summary>
@@ -38,7 +49,7 @@ public class SoapClient : ISoapClient
         => _httpClientFactory = DefaultHttpClientFactory();
 
     /// <inheritdoc />
-    public Task<HttpResponseMessage> PostAsync(
+    public async Task<HttpResponseMessage> PostAsync(
         Uri endpoint,
         SoapVersion soapVersion,
         IEnumerable<XElement> bodies,
@@ -70,6 +81,9 @@ public class SoapClient : ISoapClient
 
         // Get HTTP content
         var content = new StringContent(envelope.ToString(), Encoding.UTF8, messageConfiguration.MediaType);
+        var body = envelope.ToString();
+
+        Console.WriteLine("Sending Request:\n" + body + "\n");
 
         // Add SOAP action if any
         if (action != null)
@@ -83,13 +97,54 @@ public class SoapClient : ISoapClient
 
         // Execute call
         var httpClient = _httpClientFactory.CreateClient(nameof(SoapClient));
-        return httpClient.PostAsync(endpoint, content, cancellationToken);
+        var response = await httpClient.PostAsync(endpoint, content, cancellationToken);
+
+        return response;
     }
 
+    public string Read(HttpResponseMessage message, SoapVersion soapVersion)
+    {
+        var config = new SoapMessageConfiguration(soapVersion);
+
+        if (message == null)
+            throw new ArgumentNullException();
+        if (!message.IsSuccessStatusCode)
+            throw new ArgumentException($"The provided message is not a success message: {message.StatusCode} {message.ReasonPhrase}");
+
+        var settings = new XmlReaderSettings() { DtdProcessing = DtdProcessing.Prohibit };
+
+        using (var reader = XmlReader.Create(message.Content.ReadAsStream(), settings))
+        {
+            reader.MoveToContent();
+
+            // envelope
+            if (string.IsNullOrEmpty(reader.NamespaceURI))
+                reader.ReadStartElement("Envelope");
+            else
+                reader.ReadStartElement("Envelope", config.Schema.NamespaceName);
+            reader.MoveToContent();
+
+            // body
+            reader.ReadStartElement("Body", reader.NamespaceURI);
+            reader.MoveToContent();
+
+            // response
+            if (reader.IsStartElement("Fault", reader.NamespaceURI))
+                throw new Exception();
+
+            // result
+            reader.Read();
+
+            var result = reader.ReadElementContentAsString();
+
+            return result;
+        }
+    }
 
     public T Read<T>(HttpResponseMessage message, SoapVersion soapVersion)
     {
         var config = new SoapMessageConfiguration(soapVersion);
+        var type = typeof(T);
 
         if (message == null)
             throw new ArgumentNullException();
@@ -121,9 +176,111 @@ public class SoapClient : ISoapClient
             xmlSerializer.UnknownElement += (s, e) => Console.WriteLine($"found element {e.Element.Name} and expected {e.ExpectedElements}");
 
             T result = (T)xmlSerializer.Deserialize(reader);
+            return result;
+        }
+    }
+
+    public object Invoke(string endpoint, object[] parameters, [CallerMemberName] string methodName = "")
+    {
+        var reflectedMethod = GetType().GetMethod(methodName);
+        if (reflectedMethod == null)
+            throw new InvalidOperationException(nameof(methodName));
+
+        var returnType = reflectedMethod.ReturnType;
+        var parameterInfos = reflectedMethod.GetParameters();
+        var ns = XNamespace.Get(ServiceNamespace);
+
+        // Serialize parameters
+        var requestParameters = new List<XElement>();
+        for (int i = 0; i < parameters.Length; i++)
+        {
+            var parameter = parameters[i];
+            var parameterName = parameterInfos[i].Name!;
+            var parameterType = parameterInfos[i].ParameterType;
+
+            var serializer = new XmlSerializer(parameterType);
+            var xDoc = new XDocument();
+
+            using (var writer = xDoc.CreateWriter())
+                serializer.Serialize(writer, parameter);
+
+            requestParameters.Add(new XElement(ns.GetName(parameterName), xDoc.Root!.Nodes().InDocumentOrder()));
+        }
+
+        // create request body
+        var body = new XElement(ns.GetName(endpoint), requestParameters.ToArray());
+
+        var response = this.Post(Uri, SoapVersion, body);
+
+        // deserialize response
+        var responseString = response.Content.ReadAsStringAsync().Result;
+        var xDocResponse = XDocument.Parse(responseString);
+
+        // deserialize dataset
+        if (returnType.BaseType == typeof(DataSet))
+        {
+            var result = (DataSet)Activator.CreateInstance(returnType)!;
+            result.ReadXml(response.Content.ReadAsStream());
 
             return result;
         }
+
+        // deserialize data contract
+        if (returnType.GetCustomAttribute<DataContractAttribute>() != null)
+        {
+            var result = xDocResponse.Root!.Descendants().First(xn => xn.Name.ToString().EndsWith("Result"));
+            result.Name = XName.Get(returnType.Name, ServiceNamespace);
+
+            var serializer = new DataContractSerializer(returnType);
+
+            return serializer.ReadObject(result.CreateReader());
+        }
+
+        // deserialize primitive
+        if (returnType.IsArray)
+        {
+            var result = xDocResponse.Root!.Descendants().First(xn => xn.Name.ToString().EndsWith("Result"));
+            var descendants = result.Descendants().ToArray();
+
+            var elementType = returnType.GetElementType();
+            var array = Array.CreateInstance(elementType, descendants.Length);
+
+            for (int i = 0; i < array.Length; i++)
+                array.SetValue(descendants[i].Value, i);
+
+            return array;
+        }
+
+        else
+        {
+            var result = xDocResponse.Root!.Descendants().First(xn => xn.Name.ToString().EndsWith("Result")).Value;
+
+            if (returnType == typeof(string))
+                return result;
+            if (returnType == typeof(char))
+                return char.Parse(result);
+            
+            if (returnType == typeof(int))
+                return int.Parse(result);
+            if (returnType == typeof(long))
+                return long.Parse(result);
+            if (returnType == typeof(float))
+                return float.Parse(result);
+            if (returnType == typeof(double))
+                return double.Parse(result);
+            if (returnType == typeof(decimal))
+                return decimal.Parse(result);
+
+            if (returnType == typeof(bool))
+                return bool.Parse(result);
+            if (returnType == typeof(DateTime))
+                return DateTime.Parse(result);
+            if (returnType == typeof(Guid))
+                return Guid.Parse(result);
+
+            return result;
+        }
+
     }
 
     #region Private Methods
@@ -134,7 +291,7 @@ public class SoapClient : ISoapClient
             XElement(
                 soapMessageConfiguration.Schema + "Envelope",
                 new XAttribute(
-                    XNamespace.Xmlns + "soapenv",
+                    XNamespace.Xmlns + "soap",
                     soapMessageConfiguration.Schema.NamespaceName));
     }
 
